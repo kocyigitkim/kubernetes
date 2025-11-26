@@ -296,7 +296,8 @@ configure_kubectl() {
         log_info "kubectl config ${SUDO_USER} kullanıcısına da kopyalandı."
     fi
 
-    if ! kubectl version --short >/dev/null 2>&1; then
+    # Kubernetes 1.28+ ile uyumlu kontrol
+    if ! kubectl cluster-info >/dev/null 2>&1; then
         die "kubectl cluster'a bağlanamıyor. /etc/kubernetes/admin.conf'u kontrol et."
     fi
 
