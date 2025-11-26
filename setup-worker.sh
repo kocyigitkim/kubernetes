@@ -1,23 +1,18 @@
 #!/usr/bin/env bash
 
 ###############################################################################
-# Kubernetes Worker Node Kurulum Scripti (Ubuntu, kubeadm)
+# Kubernetes Worker Node Setup Script (Ubuntu, kubeadm)
 #
 # Özellikler:
 # - Ubuntu 22.04/24.04 için optimize
 # - containerd runtime (SystemdCgroup = true)
-# - kubeadm ile worker node kurulumu (kubelet + kubectl)
-# - Longhorn için gerekli tüm prereq paketleri
-#
-# Kullanım:
-#   sudo ./setup-worker.sh "kubeadm join <control-plane-ip>:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>"
+# - kubeadm + kubelet (+ opsiyonel kubectl) kurulumu
+# - Longhorn için gerekli temel paketler ve kernel ayarları (her node için)
 #
 # Davranış:
 # - Her adım idempotent: ilgili bileşen zaten kuruluysa tekrar kurmaz
-# - Longhorn için gerekli paketler:
-#     * open-iscsi + iscsid (iscsiadm)
-#     * nfs-common (NFSv4 client)
-#     * jq, util-linux, lvm2, cryptsetup-bin, curl, wget, conntrack vb.
+# - Node daha önce cluster'a join olduysa join adımını atlar
+# - Parametre olarak verilen kubeadm join komutunu çalıştırır
 ###############################################################################
 
 set -euo pipefail
@@ -25,7 +20,7 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 # Ayarlar (gerekirse env ile override edilebilir)
 # -----------------------------------------------------------------------------
-K8S_MINOR_VERSION="${K8S_MINOR_VERSION:-v1.34}"           # pkgs.k8s.io stable minor
+K8S_MINOR_VERSION="${K8S_MINOR_VERSION:-v1.34}"  # pkgs.k8s.io stable minor
 
 # -----------------------------------------------------------------------------
 # Renkler & log yardımcıları
@@ -60,7 +55,7 @@ is_package_installed() {
 # -----------------------------------------------------------------------------
 require_root() {
     if [[ "${EUID}" -ne 0 ]]; then
-        die "Bu script root olarak çalıştırılmalıdır. Örnek: sudo $0 \"<join-command>\""
+        die "Bu script root olarak çalıştırılmalıdır. Örnek: sudo $0 \"kubeadm join ...\""
     fi
 }
 
@@ -79,20 +74,6 @@ check_os() {
     log_info "Dağıtım: ${PRETTY_NAME}"
 }
 
-check_join_command() {
-    local join_cmd="$1"
-    
-    if [[ -z "${join_cmd}" ]]; then
-        die "Kullanım: sudo $0 \"kubeadm join <control-plane-ip>:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>\""
-    fi
-    
-    if [[ ! "${join_cmd}" =~ ^kubeadm[[:space:]]+join ]]; then
-        die "Geçersiz join komutu. 'kubeadm join' ile başlamalıdır."
-    fi
-    
-    log_info "Join komutu formatı geçerli."
-}
-
 # -----------------------------------------------------------------------------
 # Sistem hazırlığı
 # -----------------------------------------------------------------------------
@@ -106,10 +87,6 @@ update_system() {
 install_base_packages() {
     log_info "Temel paketler ve Longhorn prereq paketleri kuruluyor..."
 
-    # Longhorn + Kubernetes için gerekenler:
-    # - curl, wget, apt-transport-https, ca-certificates, gpg/gnupg, lsb-release
-    # - jq, util-linux, lvm2, cryptsetup-bin, conntrack
-    # - open-iscsi (iscsid), nfs-common
     apt-get install -y -qq \
         apt-transport-https \
         ca-certificates \
@@ -134,11 +111,9 @@ install_base_packages() {
     echo "iscsi_tcp" >/etc/modules-load.d/iscsi-tcp.conf
     modprobe iscsi_tcp || log_warn "iscsi_tcp modülü yüklenemedi, manuel kontrol et."
 
-    # open-iscsi paketi iscsid servisini getiriyor
+    # open-iscsi + iscsid servisi
     log_info "iscsid servisi enable + start ediliyor..."
     systemctl enable --now iscsid >/dev/null 2>&1 || log_warn "iscsid servisi başlatılamadı, durumu kontrol et."
-
-    # Longhorn NFS client
     systemctl enable --now open-iscsi >/dev/null 2>&1 || true
 
     log_info "Temel paketler ve Longhorn prereq paketleri kuruldu."
@@ -247,165 +222,84 @@ install_kubernetes_components() {
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq kubelet kubeadm kubectl || die "Kubernetes paketleri kurulamadı."
     apt-mark hold kubelet kubeadm kubectl
 
-    systemctl enable --now kubelet >/dev/null 2>&1 || log_warn "kubelet servisi başlatılamadı (join öncesi normal)."
+    systemctl enable --now kubelet >/dev/null 2>&1 || die "kubelet servisi başlatılamadı."
 
-    if ! command_exists kubeadm || ! command_exists kubectl; then
-        die "kubeadm veya kubectl komutları bulunamadı."
+    if ! is_service_active kubelet; then
+        die "kubelet servisi aktif değil."
     fi
 
-    log_info "Kubernetes bileşenleri kuruldu."
+    if ! command_exists kubeadm; then
+        die "kubeadm komutu bulunamadı."
+    fi
+
+    log_info "Kubernetes bileşenleri kuruldu ve kontrol edildi."
 }
 
 # -----------------------------------------------------------------------------
-# Longhorn prereq health check
-# -----------------------------------------------------------------------------
-check_longhorn_prereqs() {
-    log_info "Longhorn için gerekli paket ve servisler kontrol ediliyor..."
-
-    local required_pkgs=(
-        "open-iscsi"
-        "nfs-common"
-        "jq"
-        "util-linux"
-        "lvm2"
-        "cryptsetup-bin"
-    )
-
-    for pkg in "${required_pkgs[@]}"; do
-        if ! is_package_installed "${pkg}"; then
-            die "Longhorn prereq paketi eksik: ${pkg} (install_base_packages fonksiyonunu kontrol et)."
-        fi
-    done
-
-    if ! is_service_active iscsid; then
-        die "iscsid servisi aktif değil. open-iscsi ve iscsid servis durumunu kontrol et."
-    fi
-
-    if ! command_exists iscsiadm; then
-        die "iscsiadm komutu bulunamadı. open-iscsi kurulumu hatalı olabilir."
-    fi
-
-    if ! command_exists mount.nfs; then
-        die "mount.nfs komutu bulunamadı. nfs-common kurulumu hatalı olabilir."
-    fi
-
-    log_info "Longhorn prereq kontrolleri başarılı."
-}
-
-# -----------------------------------------------------------------------------
-# Worker node cluster'a katılım
+# Worker node join
 # -----------------------------------------------------------------------------
 join_cluster() {
     local join_cmd="$1"
-    
+
+    if [[ -z "${join_cmd}" ]]; then
+        die "kubeadm join komutu parametre olarak verilmelidir. Örnek: $0 \"kubeadm join ...\""
+    fi
+
     if [[ -f /etc/kubernetes/kubelet.conf ]]; then
-        log_warn "/etc/kubernetes/kubelet.conf bulundu. Bu node zaten bir cluster'a katılmış görünüyor."
-        log_warn "Yeniden katılmak için önce 'kubeadm reset' çalıştırın."
+        log_warn "/etc/kubernetes/kubelet.conf bulundu. Bu node büyük ihtimalle cluster'a zaten join olmuş. kubeadm join atlanıyor."
         return
     fi
 
-    log_info "Worker node cluster'a katılıyor..."
-    log_info "Join komutu: ${join_cmd}"
-    
-    eval "${join_cmd}" || die "kubeadm join komutu başarısız oldu."
+    log_info "Bu node cluster'a join ediliyor..."
+    log_info "Çalıştırılan komut: ${join_cmd}"
+
+    # Temizlik: olası eski/yarım configler
+    kubeadm reset -f || true
+
+    # join komutunu çalıştır
+    eval "${join_cmd}" || die "kubeadm join başarısız oldu."
 
     if [[ ! -f /etc/kubernetes/kubelet.conf ]]; then
-        die "kubeadm join sonrası kubelet.conf bulunamadı."
+        die "kubeadm join sonrası /etc/kubernetes/kubelet.conf bulunamadı. Join başarısız olabilir."
     fi
 
-    log_info "Worker node başarıyla cluster'a katıldı."
-}
+    # kubelet'in aktif olduğundan emin ol
+    systemctl enable --now kubelet >/dev/null 2>&1 || die "kubelet servisi join sonrası başlatılamadı."
 
-wait_for_kubelet() {
-    log_info "kubelet servisinin aktif olması bekleniyor..."
-    
-    local max_wait=60
-    local elapsed=0
-    
-    while ! is_service_active kubelet && [[ ${elapsed} -lt ${max_wait} ]]; do
-        sleep 2
-        elapsed=$((elapsed + 2))
-    done
-    
     if ! is_service_active kubelet; then
-        log_warn "kubelet servisi ${max_wait}s içinde aktif olmadı. Servis durumu:"
-        systemctl status kubelet --no-pager || true
-    else
-        log_info "kubelet servisi aktif."
+        die "kubelet servisi join sonrası aktif değil. journalctl -u kubelet ile logları kontrol et."
     fi
-}
 
-# -----------------------------------------------------------------------------
-# Kubectl kolaylıkları (opsiyonel - worker'da admin config olmayacak)
-# -----------------------------------------------------------------------------
-enable_kubectl_completion() {
-    log_info "kubectl bash completion ve alias ayarlanıyor..."
-
-    if command_exists kubectl; then
-        kubectl completion bash >/etc/bash_completion.d/kubectl 2>/dev/null || true
-
-        {
-            echo 'alias k=kubectl'
-            echo 'complete -o default -F __start_kubectl k'
-        } >> /root/.bashrc
-
-        if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
-            local user_home
-            user_home="$(eval echo ~"${SUDO_USER}")"
-            {
-                echo 'alias k=kubectl'
-                echo 'complete -o default -F __start_kubectl k'
-            } >> "${user_home}/.bashrc"
-        fi
-
-        log_info "kubectl alias ve completion ayarlandı."
-    fi
+    log_info "Worker node başarılı şekilde cluster'a join oldu (lokal kontrol)."
 }
 
 print_summary() {
     echo
-    log_info "=============================================="
-    log_info " Worker Node kurulumu tamamlandı"
-    log_info "=============================================="
+    log_info "======================================="
+    log_info " Kubernetes Worker Node kurulumu bitti"
+    log_info "======================================="
     echo
 
-    log_info "Node bilgisi:"
-    echo "  Hostname: $(hostname)"
-    echo "  IP: $(hostname -I | awk '{print $1}')"
+    log_info "Lokal servis durumu:"
+    systemctl status kubelet --no-pager -l | sed -n '1,20p' || true
     echo
 
-    log_info "Servis durumları:"
-    systemctl status kubelet --no-pager | head -n 3 || true
-    systemctl status containerd --no-pager | head -n 3 || true
-    systemctl status iscsid --no-pager | head -n 3 || true
-    echo
-
-    log_info "Longhorn prereq durumu:"
-    check_longhorn_prereqs 2>/dev/null || log_warn "Longhorn prereq kontrolünde uyarı var."
-    echo
-
-    log_info "Control-plane'den node durumunu kontrol etmek için:"
+    log_info "Kontrol-plane tarafında node'u kontrol etmek için:"
     echo "  kubectl get nodes -o wide"
-    echo "  kubectl get nodes $(hostname) -o yaml"
     echo
-    
-    log_info "Worker node üzerinde log kontrolleri:"
+    log_info "Eğer node Ready değilse kubelet loglarını inceleyin:"
     echo "  journalctl -u kubelet -f"
-    echo "  journalctl -u containerd -f"
     echo
-    
-    log_info "Yeni shell'de alias ve completion için: source ~/.bashrc"
 }
 
 # -----------------------------------------------------------------------------
 # Ana akış
 # -----------------------------------------------------------------------------
 main() {
-    local join_command="${1:-}"
-    
+    local JOIN_COMMAND="${1:-}"
+
     require_root
     check_os
-    check_join_command "${join_command}"
 
     log_info "Kubernetes Worker Node kurulum akışı başlıyor..."
 
@@ -417,12 +311,7 @@ main() {
     install_containerd
     add_kubernetes_repo
     install_kubernetes_components
-    check_longhorn_prereqs
-
-    join_cluster "${join_command}"
-    wait_for_kubelet
-
-    enable_kubectl_completion
+    join_cluster "${JOIN_COMMAND}"
     print_summary
 }
 
